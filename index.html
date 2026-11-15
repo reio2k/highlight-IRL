@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera Find</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #000; color: #ccc;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  /* kept in the layout (not display:none) so mobile browsers keep decoding frames */
+  #cam { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+  #find {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    width: calc(100% - 24px); max-width: 520px; box-sizing: border-box;
+    display: flex; align-items: center; gap: 4px;
+    padding: 6px; border-radius: 6px;
+    background: #252526; border: 1px solid #454545;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .5);
+  }
+  #q {
+    flex: 1; min-width: 0; box-sizing: border-box;
+    height: 34px; padding: 0 8px;
+    font: inherit; font-size: 16px; /* 16px stops iOS zooming on focus */
+    color: #ccc; background: #3c3c3c;
+    border: 1px solid transparent; border-radius: 3px; outline: none;
+  }
+  #q:focus { border-color: #007fd4; }
+  #q::placeholder { color: #8a8a8a; }
+  .opt {
+    flex: none; width: 34px; height: 34px; padding: 0;
+    font: inherit; font-size: 15px; line-height: 1;
+    color: #ccc; background: transparent;
+    border: 1px solid transparent; border-radius: 3px; cursor: pointer;
+  }
+  .opt:hover { background: rgba(90, 93, 94, .31); }
+  .opt:focus-visible { outline: 1px solid #007fd4; }
+  .opt[aria-pressed="true"] {
+    color: #fff; background: rgba(0, 127, 212, .4); border-color: #007fd4;
+  }
+  /* VS Code's "whole word" glyph: ab sitting in a bracket-like underline */
+  #word span {
+    display: inline-block; padding: 0 2px 1px;
+    border: 1px solid currentColor; border-top: 0;
+  }
+  #count {
+    flex: none; min-width: 64px; padding: 0 6px;
+    font-size: 13px; text-align: right; white-space: nowrap; color: #ccc;
+  }
+  #msg {
+    position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
+    max-width: calc(100% - 32px); box-sizing: border-box;
+    padding: 8px 12px; border-radius: 6px;
+    font-size: 14px; text-align: center;
+    background: rgba(37, 37, 38, .92); border: 1px solid #454545;
+  }
+  #msg:empty { display: none; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="view"></canvas>
+
+<div id="find" role="search">
+  <input id="q" type="text" placeholder="Find" aria-label="Find"
+         autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <button id="case" class="opt" type="button" aria-pressed="false"
+          aria-label="Match case" title="Match case">Aa</button>
+  <button id="word" class="opt" type="button" aria-pressed="false"
+          aria-label="Match whole word" title="Match whole word"><span>ab</span></button>
+  <div id="count" aria-live="polite"></div>
+</div>
+<div id="msg" role="status">Starting camera…</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+// ---- settings -------------------------------------------------------------
+const OCR_LANG = 'eng';          // e.g. 'nld', 'fra', or 'eng+nld' (slower)
+const OCR_MAX_SIDE = 1280;       // frames are downscaled to this before OCR
+const HIGHLIGHT = '#ffe600';
+
+// ---- elements & state -----------------------------------------------------
+const video = document.getElementById('cam');
+const view = document.getElementById('view');
+const ctx = view.getContext('2d');
+const input = document.getElementById('q');
+const caseBtn = document.getElementById('case');
+const wordBtn = document.getElementById('word');
+const countEl = document.getElementById('count');
+const msgEl = document.getElementById('msg');
+
+const frame = document.createElement('canvas');
+const fctx = frame.getContext('2d', { willReadFrequently: true });
+
+let lines = [];      // last OCR result: [[{text, x0, y0, x1, y1}, ...], ...] in OCR-frame px
+let pixels = null;   // ImageData of the frame that produced `lines`
+let ocrScale = 1;    // OCR-frame px per video px
+let hits = [];       // rectangles to highlight, in video px
+let ocrReady = false;
+
+// ---- matching -------------------------------------------------------------
+function buildRegex(query, matchCase, wholeWord) {
+  const q = query.trim();
+  if (!q) return null;
+  let src = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  if (wholeWord) src = '(?<![\\p{L}\\p{N}_])' + src + '(?![\\p{L}\\p{N}_])';
+  return new RegExp(src, 'gu' + (matchCase ? '' : 'i'));
+}
+
+// Returns { count, rects } where rects are {x0, y0, x1, y1} in OCR-frame px.
+// A match that covers part of a word highlights only that part of its box;
+// a match spanning several words yields one rect per word.
+function findHits(ocrLines, re) {
+  const rects = [];
+  let count = 0;
+  if (!re) return { count, rects };
+  for (const words of ocrLines) {
+    let text = '';
+    const owner = [];                       // per char: [wordIndex, charIndex] or null
+    words.forEach((w, wi) => {
+      if (wi) { text += ' '; owner.push(null); }
+      for (let ci = 0; ci < w.text.length; ci++) owner.push([wi, ci]);
+      text += w.text;
+    });
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text))) {
+      if (!m[0].length) { re.lastIndex++; continue; }
+      count++;
+      const span = new Map();               // wordIndex -> [firstChar, lastChar]
+      for (let i = m.index; i < m.index + m[0].length; i++) {
+        const o = owner[i];
+        if (!o) continue;
+        const s = span.get(o[0]);
+        if (s) s[1] = o[1]; else span.set(o[0], [o[1], o[1]]);
+      }
+      for (const [wi, [a, b]] of span) {
+        const w = words[wi], len = w.text.length, width = w.x1 - w.x0;
+        rects.push({
+          x0: w.x0 + width * a / len,
+          x1: w.x0 + width * (b + 1) / len,
+          y0: w.y0, y1: w.y1
+        });
+      }
+    }
+  }
+  return { count, rects };
+}
+
+// Mean brightness of a box in the OCR frame; text is the minority of pixels,
+// so this is effectively the background brightness.
+function isLight(r) {
+  if (!pixels) return true;
+  const W = pixels.width, H = pixels.height, d = pixels.data;
+  const x0 = Math.max(0, Math.floor(r.x0)), x1 = Math.min(W, Math.ceil(r.x1));
+  const y0 = Math.max(0, Math.floor(r.y0)), y1 = Math.min(H, Math.ceil(r.y1));
+  let sum = 0, n = 0;
+  for (let y = y0; y < y1; y += 2) {
+    for (let x = x0; x < x1; x += 2) {
+      const i = (y * W + x) * 4;
+      sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      n++;
+    }
+  }
+  return n ? sum / n >= 128 : true;
+}
+
+function rematch() {
+  const re = buildRegex(input.value,
+    caseBtn.getAttribute('aria-pressed') === 'true',
+    wordBtn.getAttribute('aria-pressed') === 'true');
+  const { count, rects } = findHits(lines, re);
+  hits = rects.map(r => ({
+    x: r.x0 / ocrScale, y: r.y0 / ocrScale,
+    w: (r.x1 - r.x0) / ocrScale, h: (r.y1 - r.y0) / ocrScale,
+    light: isLight(r)
+  }));
+  if (!re) countEl.textContent = '';
+  else if (!ocrReady) countEl.textContent = '…';
+  else countEl.textContent = count ? count + (count === 1 ? ' result' : ' results') : 'No results';
+}
+
+input.addEventListener('input', rematch);
+for (const b of [caseBtn, wordBtn]) {
+  b.addEventListener('click', () => {
+    b.setAttribute('aria-pressed', b.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+    rematch();
+  });
+}
+
+// ---- drawing --------------------------------------------------------------
+function draw() {
+  requestAnimationFrame(draw);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cw = Math.round(view.clientWidth * dpr), ch = Math.round(view.clientHeight * dpr);
+  if (view.width !== cw || view.height !== ch) { view.width = cw; view.height = ch; }
+
+  // fill the screen with the camera image ("cover")
+  const s = Math.max(cw / vw, ch / vh);
+  const ox = (cw - vw * s) / 2, oy = (ch - vh * s) / 2;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(video, ox, oy, vw * s, vh * s);
+
+  // Dark text on a light page: multiply = yellow marker, text stays dark.
+  // Light text on a dark surface: difference = background turns yellow, text inverts to blue.
+  ctx.fillStyle = HIGHLIGHT;
+  for (const h of hits) {
+    const pad = h.h * 0.12;
+    ctx.globalCompositeOperation = h.light ? 'multiply' : 'difference';
+    ctx.fillRect(ox + (h.x - pad) * s, oy + (h.y - pad) * s, (h.w + 2 * pad) * s, (h.h + 2 * pad) * s);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// ---- OCR loop -------------------------------------------------------------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function ocrLoop(worker) {
+  for (;;) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (document.hidden || !vw || video.paused) { await sleep(300); continue; }
+    const k = Math.min(1, OCR_MAX_SIDE / Math.max(vw, vh));
+    frame.width = Math.round(vw * k);
+    frame.height = Math.round(vh * k);
+    fctx.drawImage(video, 0, 0, frame.width, frame.height);
+    const shot = fctx.getImageData(0, 0, frame.width, frame.height);
+    try {
+      const { data } = await worker.recognize(frame);
+      lines = (data.lines || []).map(l =>
+        (l.words || [])
+          .filter(w => w.text && w.text.trim() && w.confidence > 15)
+          .map(w => ({ text: w.text.trim(), x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1 }))
+      ).filter(l => l.length);
+      pixels = shot;
+      ocrScale = k;
+      if (!ocrReady) { ocrReady = true; msgEl.textContent = ''; }
+      rematch();
+    } catch (e) {
+      console.error(e);
+      await sleep(500);
+    }
+    await sleep(30);
+  }
+}
+
+// ---- start ----------------------------------------------------------------
+async function start() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    msgEl.textContent = 'Camera unavailable. This page must be opened over https (or on localhost).';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    msgEl.textContent = 'Could not open the camera: ' + (e.message || e.name) +
+      '. Allow camera access for this page and reload.';
+    return;
+  }
+  requestAnimationFrame(draw);
+
+  msgEl.textContent = 'Loading text recognition…';
+  try {
+    if (typeof Tesseract === 'undefined') throw new Error('library did not load');
+    const worker = await Tesseract.createWorker(OCR_LANG);
+    msgEl.textContent = 'Reading text…';
+    ocrLoop(worker);
+  } catch (e) {
+    console.error(e);
+    msgEl.textContent = 'Text recognition failed to load (needs an internet connection the first time).';
+  }
+}
+start();
+</script>
+</body>
+</html>
